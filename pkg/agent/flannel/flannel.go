@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet/kube"
 	"github.com/flannel-io/flannel/pkg/trafficmngr/iptables"
 	"github.com/joho/godotenv"
@@ -66,6 +68,73 @@ func flannel(ctx context.Context, flannelIface *net.Interface, flannelConf, kube
 	if err != nil {
 		return pkgerrors.WithMessage(err, "failed to create the SubnetManager")
 	}
+
+	leaseResultsChan := make(chan []lease.LeaseWatchResult)
+	go func() {
+		if err := sm.WatchLeases(ctx, leaseResultsChan); err != nil {
+			logrus.Errorf("Failed to watch leases: %v", err)
+		}
+	}()
+
+	// Start listening for subnet changes
+	go func() {
+		// Use type assertion to check if `sm` is of the expected type
+		gatewayIP, err := GetGatewayIP(extIface.Iface)
+		if err != nil {
+			logrus.Errorf("Failed to get gateway IP: %v", err)
+			return
+		}
+
+		for {
+			select {
+			case leaseResults := <-leaseResultsChan:
+				for _, result := range leaseResults {
+					for _, event := range result.Events {
+						switch event.Type {
+						case lease.EventAdded:
+							logrus.Infof("Subnet added: %v", event.Lease)
+							subnetCIDR := event.Lease.Subnet.String()
+							flannelIfaceIP := event.Lease.Attrs.PublicIP.String()
+							url := fmt.Sprintf("http://%s/services/route?cidr=%s&ip=%s", gatewayIP.String(), subnetCIDR, flannelIfaceIP)
+							logrus.Infof("Registering subnet change via API: %s", url)
+							resp, err := http.Get(url)
+							if err != nil {
+								logrus.Errorf("Failed to register subnet change via API: %v", err)
+								continue
+							}
+							defer resp.Body.Close()
+
+							if resp.StatusCode != http.StatusOK {
+								logrus.Errorf("Failed to register subnet change via API, status code: %d", resp.StatusCode)
+							} else {
+								logrus.Infof("Successfully registered subnet change via API for CIDR: %s", subnetCIDR)
+							}
+						case lease.EventRemoved:
+							logrus.Infof("Subnet removed: %v", event.Lease)
+							subnetCIDR := event.Lease.Subnet.String()
+							url := fmt.Sprintf("http://%s/services/route?cidr=%s", gatewayIP.String(), subnetCIDR)
+							logrus.Infof("Registering subnet removal via API: %s", url)
+							resp, err := http.Get(url)
+							if err != nil {
+								logrus.Errorf("Failed to register subnet removal via API: %v", err)
+								continue
+							}
+							defer resp.Body.Close()
+
+							if resp.StatusCode != http.StatusOK {
+								logrus.Errorf("Failed to register subnet removal via API, status code: %d", resp.StatusCode)
+							} else {
+								logrus.Infof("Successfully registered subnet removal via API for CIDR: %s", subnetCIDR)
+							}
+						}
+					}
+				}
+			case <-ctx.Done():
+				logrus.Info("Stopping subnet change listener")
+				return
+			}
+		}
+	}()
 
 	config, err := sm.GetNetworkConfig(ctx)
 	if err != nil {

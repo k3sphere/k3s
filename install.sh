@@ -95,7 +95,7 @@ set -o noglob
 #     Channel to use for fetching k3s download URL.
 #     Defaults to 'stable'.
 
-GITHUB_URL=${GITHUB_URL:-https://github.com/k3s-io/k3s/releases}
+GITHUB_URL=${GITHUB_URL:-https://github.com/k3sphere/k3s/releases}
 GITHUB_PR_URL=""
 STORAGE_URL=https://k3s-ci-builds.s3.amazonaws.com
 DOWNLOADER=
